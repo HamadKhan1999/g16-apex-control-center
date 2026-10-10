@@ -242,6 +242,9 @@ class GameDashboardWindow(ctk.CTkToplevel):
             text=f"Session {hrs:02d}:{mins:02d}:{secs:02d}  |  ● RECORDING")
         try:
             import psutil
+            if not self.exe_name:
+                self.after(1000, self._tick)
+                return
             running = any((p.info.get("name") or "").lower() == self.exe_name
                           for p in psutil.process_iter(["name"]))
             if running:

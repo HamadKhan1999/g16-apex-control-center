@@ -183,6 +183,7 @@ class G16App(ctk.CTk):
         for key, tab in hotkeys.items():
             self.bind(f"<Control-Alt-KeyPress-{key}>",
                       lambda e, t=tab: self.switch_tab(t))
+        self.bind("<Control-Alt-KeyPress-d>", lambda e: self.toggle_game_dashboard())
 
         # Remote shot requests: write a tab name to .shot_request and the app
         # switches to it (used by headless screenshot automation)
@@ -190,18 +191,21 @@ class G16App(ctk.CTk):
         self.after(1500, self._monitor_fit_loop)
 
     def _monitor_fit_loop(self):
-        """Keep the window inside whatever monitor it currently sits on:
-        shrink the widget scale when the screen is narrower than the window
-        (e.g. the portrait secondary screen), restore when back on primary."""
+        """Keep the window inside whatever monitor it sits on. Debounced:
+        only adjusts on monitor change or real overflow, with a cooldown -
+        never fights its own adjustments."""
         try:
             self._fit_to_monitor()
         except Exception:
             pass
-        self.after(2000, self._monitor_fit_loop)
+        self.after(2500, self._monitor_fit_loop)
 
     def _fit_to_monitor(self):
         if self.state() == "iconic" or self.winfo_width() < 100:
             return
+        now = time.time()
+        if now - getattr(self, "_last_fit_time", 0) < 6.0:
+            return  # cooldown - never adjust twice within 6 s
         x, y = self.winfo_x(), self.winfo_y()
         w, h = self.winfo_width(), self.winfo_height()
         cx, cy = x + w // 2, y + h // 2
@@ -212,21 +216,28 @@ class G16App(ctk.CTk):
                 break
         if target is None:
             return
-        avail_w = min(target["work_width"], target["width"]) - 24
-        avail_h = min(target["work_height"], target["height"]) - 24
+        mon_key = (target["left"], target["top"], target["width"], target["height"])
+        if mon_key == getattr(self, "_last_fit_mon", None):
+            return  # same monitor as last fit - leave it alone
+
+        avail_w = target["work_width"] - 24
+        avail_h = target["work_height"] - 24
         widget_scaling = ctk.ScalingTracker.get_widget_scaling(self)
         phys_w = w * widget_scaling
         phys_h = h * widget_scaling
-        s = min(1.0, avail_w / max(phys_w, 1), avail_h / max(phys_h, 1))
-        if s < 0.98:
+
+        if phys_w > avail_w or phys_h > avail_h:
+            s = min(1.0, avail_w / max(phys_w, 1), avail_h / max(phys_h, 1))
             new_scaling = max(widget_scaling * s, 0.6)
-            if abs(new_scaling - widget_scaling) > 0.01:
-                ctk.ScalingTracker.set_window_scaling(new_scaling)
-        # clamp the window into the monitor's work area
-        nx = max(target["work_left"], min(self.winfo_x(), target["work_left"] + avail_w - 40))
-        ny = max(target["work_top"], min(self.winfo_y(), target["work_top"] + avail_h - 40))
-        if (nx, ny) != (self.winfo_x(), self.winfo_y()):
+            ctk.ScalingTracker.set_window_scaling(new_scaling)
+
+        nx = max(target["work_left"], min(x, target["work_left"] + avail_w - 40))
+        ny = max(target["work_top"], min(y, target["work_top"] + avail_h - 40))
+        if (nx, ny) != (x, y):
             self.geometry(f"+{nx}+{ny}")
+
+        self._last_fit_time = now
+        self._last_fit_mon = mon_key
 
     def _check_shot_request(self):
         try:
@@ -1056,6 +1067,20 @@ class G16App(ctk.CTk):
         self.record_status = ctk.CTkLabel(val_card, text="", font=ctk.CTkFont(size=11), text_color=COLOR_TEXT_MUTED)
         self.record_status.pack(padx=20, anchor="w", pady=(0, 4))
 
+        # second-screen dashboard toggle (reopen anytime, even after Esc)
+        self.dash_btn = ctk.CTkButton(
+            val_card,
+            text="🖥️  Open Second-Screen Dashboard",
+            width=240,
+            height=34,
+            corner_radius=6,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#10b981",
+            hover_color="#059669",
+            command=self.toggle_game_dashboard
+        )
+        self.dash_btn.pack(anchor="w", padx=20, pady=(2, 0))
+
         # D:\GAMES LIBRARY SECTION
         header_row = ctk.CTkFrame(f, fg_color="transparent")
         header_row.pack(fill="x", padx=10, pady=(10, 8))
@@ -1175,6 +1200,16 @@ class G16App(ctk.CTk):
         ok, msg = optimizer.launch_game(game_info, backend_controller=self.backend)
         print(f"Launch {game_info['name']}: {msg}")
         self.maybe_autorecord(game_info.get("name", "game"), game_info.get("path"))
+
+    def toggle_game_dashboard(self):
+        if self.game_dashboard is not None:
+            self.game_dashboard.close_dashboard()
+            self.game_dashboard = None
+            self.dash_btn.configure(text="🖥️  Open Second-Screen Dashboard",
+                                    fg_color="#10b981")
+        else:
+            self.open_game_dashboard("Game Dashboard", None)
+            self.dash_btn.configure(text="✕  Close Dashboard", fg_color="#ef4444")
 
     def maybe_autorecord(self, game_name: str, exe_path: str = None):
         if self.dash_switch.get() == 1:
