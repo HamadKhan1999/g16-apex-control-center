@@ -196,6 +196,21 @@ class G16App(ctk.CTk):
                 os.remove(p)
                 if req == "open_dash":
                     self.open_game_dashboard("TEST MODE", "explorer.exe")
+                elif req == "raise_dash":
+                    if self.game_dashboard:
+                        self.game_dashboard.attributes("-topmost", True)
+                        self.game_dashboard.lift()
+                        self.game_dashboard.focus_force()
+                        self.after(1200, lambda: self.game_dashboard.attributes(
+                            "-topmost", False))
+                elif req == "capture_dash":
+                    if self.game_dashboard:
+                        try:
+                            self.game_dashboard.capture_to_file(
+                                os.path.join(SCRIPT_DIR, "docs", "screenshots",
+                                             "07_second_screen.png"))
+                        except Exception:
+                            pass
                 elif req == "close_dash":
                     if self.game_dashboard:
                         self.game_dashboard.close_dashboard()

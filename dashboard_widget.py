@@ -70,6 +70,18 @@ class GameDashboardWindow(ctk.CTkToplevel):
     def __init__(self, master, game_name: str, exe_name: str, monitor: dict):
         super().__init__(master)
 
+        # CTk auto-scales every widget by the Windows DPI factor (150% here),
+        # which would render our monitor-sized layout 1.5x too big. Pin THIS
+        # window's scaling BEFORE any widget exists, so everything renders
+        # 1:1 physical pixels instead of CTk's 1.5x DPI scaling.
+        w, h = monitor["width"], monitor["height"]
+        self._fit_scaling = max(0.4, min(1.0, min(w / 1440.0, h / 2160.0)))
+        self._monitor_w, self._monitor_h = w, h
+        try:
+            ctk.ScalingTracker.window_dpi_scaling_dict[self] = self._fit_scaling
+        except Exception:
+            pass
+
         self.game_name = game_name
         self.exe_name = exe_name.lower()
         self.session_start = time.time()
@@ -77,14 +89,13 @@ class GameDashboardWindow(ctk.CTkToplevel):
         self._gone_checks = 0
         self._closed = False
 
-        w, h = monitor["width"], monitor["height"]
         self.overrideredirect(True)
         self.geometry(f"{w}x{h}+{monitor['left']}+{monitor['top']}")
         self.configure(fg_color="#07090f")
         self.bind("<Escape>", lambda e: self.close_dashboard())
 
         col = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        col.pack(fill="both", expand=True, padx=30, pady=30)
+        col.pack(fill="both", expand=True, padx=14, pady=24)
 
         # Header
         hdr = ctk.CTkFrame(col, fg_color="transparent")
@@ -189,12 +200,19 @@ class GameDashboardWindow(ctk.CTkToplevel):
                       font=ctk.CTkFont(size=12, weight="bold"),
                       command=self.close_dashboard).pack(side="right", padx=10)
 
+        # widgets were created at the pinned scaling - just re-assert the
+        # dict entry in case CTk re-registered the window during creation
+        try:
+            ctk.ScalingTracker.window_dpi_scaling_dict[self.winfo_toplevel()] = self._fit_scaling
+        except Exception:
+            pass
+
         self.after(1000, self._tick)
 
     def _big_card(self, parent, col, name, accent="#00e5ff"):
         card = ctk.CTkFrame(parent, fg_color="#12141f", corner_radius=16,
                             border_width=1, border_color="#1f2436")
-        card.grid(row=0, column=col, sticky="nsew", padx=8, ipady=6)
+        card.grid(row=0, column=col, sticky="nsew", padx=4, ipady=6)
         ctk.CTkLabel(card, text=f"{name} TEMPERATURE",
                      font=ctk.CTkFont(size=15, weight="bold"),
                      text_color="#7c8aa0").pack(anchor="w", padx=30, pady=(14, 0))
@@ -331,6 +349,39 @@ class GameDashboardWindow(ctk.CTkToplevel):
             c.create_line(pts, fill="#00e5ff", width=3, smooth=True)
         c.create_text(w - 10, 14, text=f"peak {max(hist):.0f}", fill="#475569",
                       font=("Consolas", 11), anchor="e")
+
+    def capture_to_file(self, path):
+        """PrintWindow self-capture - works even while occluded by other windows."""
+        import ctypes
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        class BMIH(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32), ("xr", ctypes.c_int32),
+                        ("yr", ctypes.c_int32), ("c1", ctypes.c_uint32),
+                        ("c2", ctypes.c_uint32)]
+
+        w = self._monitor_w
+        h = self._monitor_h
+        hwnd = user32.GetAncestor(self.winfo_id(), 2)  # GA_ROOT
+        hdc = user32.GetWindowDC(hwnd)
+        mem = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        gdi32.SelectObject(mem, bmp)
+        ok = user32.PrintWindow(hwnd, mem, 2)  # PW_RENDERFULLCONTENT
+        bmi = BMIH(ctypes.sizeof(BMIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bmi), 0)
+        from PIL import Image
+        img = Image.frombuffer("RGBA", (w, h), buf.raw, "raw", "BGRA", 0, 1).convert("RGB")
+        img.save(path)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem)
+        user32.ReleaseDC(hwnd, hdc)
+        return ok
 
     def close_dashboard(self):
         if getattr(self, "_closed", False):
