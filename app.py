@@ -138,9 +138,11 @@ class G16App(ctk.CTk):
         # Mini HUD Window Instance (created hidden)
         self.mini_hud: Optional[ui_widgets.MiniHUDWindow] = None
 
-        # Dark titlebar + gradient background textures (visual overhaul)
+        # Real DWM acrylic glass backdrop + dark titlebar; falls back to
+        # gradient textures if the composition call is unavailable.
+        self._acrylic_ok = False
+        self.after(60, self._apply_acrylic)
         self._apply_dark_titlebar()
-        self._apply_background_textures()
 
         # Backend Engine
         self.backend = G16Backend(on_state_update=self.on_hardware_update)
@@ -242,6 +244,56 @@ class G16App(ctk.CTk):
             pass
 
     # ==========================================
+    # Visual shell: DWM acrylic glass + dark titlebar
+    # ==========================================
+    ACRYLIC_KEY = "#010203"  # magic color key - nothing else may use it
+
+    def _apply_acrylic(self):
+        """Turn the window background into real frosted-glass acrylic:
+        DWM ACCENT_ENABLE_ACRYLICBLURBEHIND + Tk transparent color key.
+        Falls back silently to the gradient textures if unsupported."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                raise RuntimeError("no hwnd")
+
+            class ACCENT_POLICY(ctypes.Structure):
+                _fields_ = [("AccentState", ctypes.c_uint),
+                            ("AccentFlags", ctypes.c_uint),
+                            ("GradientColor", ctypes.c_uint),
+                            ("AnimationId", ctypes.c_uint)]
+
+            class WCA_DATA(ctypes.Structure):
+                _fields_ = [("Attrib", ctypes.c_uint),
+                            ("pvData", ctypes.POINTER(ACCENT_POLICY)),
+                            ("cbData", ctypes.c_size_t)]
+
+            # AccentState 4 = ACCENT_ENABLE_ACRYLICBLURBEHIND
+            # GradientColor is 0xAABBGGRR: smoked dark glass at ~80% strength
+            ap = ACCENT_POLICY(AccentState=4, AccentFlags=2,
+                               GradientColor=0x5533251E, AnimationId=0)
+            wca = WCA_DATA(Attrib=19, pvData=ctypes.pointer(ap),
+                           cbData=ctypes.sizeof(ap))
+            if not ctypes.windll.user32.SetWindowCompositionAttribute(
+                    hwnd, ctypes.byref(wca)):
+                raise RuntimeError("SetWindowCompositionAttribute failed")
+
+            # the color key lets the acrylic backdrop show through everywhere
+            # the app paints its background
+            key = self.ACRYLIC_KEY
+            self.attributes("-transparentcolor", key)
+            self.configure(fg_color=key)
+            self.content_frame.configure(fg_color=key)
+            self.sidebar.configure(fg_color=key)
+
+            self._acrylic_ok = True
+            print('[acrylic] backdrop applied')
+        except Exception as ex:
+            print('[acrylic] FAILED:', ex)
+            self._acrylic_ok = False
+            self._apply_background_textures()
+
+    # ==========================================
     # Sidebar
     # ==========================================
     def create_sidebar(self):
@@ -251,7 +303,7 @@ class G16App(ctk.CTk):
         self.sidebar.grid_rowconfigure(6, weight=1)
 
         # sidebar gradient texture behind its widgets
-        if hasattr(self, "_bg_side"):
+        if not getattr(self, "_acrylic_ok", False) and hasattr(self, "_bg_side"):
             side_lbl = ctk.CTkLabel(self.sidebar, image=self._bg_side, text="")
             side_lbl.place(x=0, y=0, relwidth=1, relheight=1)
             side_lbl.lower()
