@@ -26,6 +26,7 @@ from backend import G16Backend, HardwareState
 import optimizer
 import valcareer
 import game_art
+import dashboard_widget
 import ui_widgets
 
 # Configure CustomTkinter Theme
@@ -137,6 +138,7 @@ class G16App(ctk.CTk):
 
         # Mini HUD Window Instance (created hidden)
         self.mini_hud: Optional[ui_widgets.MiniHUDWindow] = None
+        self.game_dashboard: Optional[dashboard_widget.GameDashboardWindow] = None
 
         # Real DWM acrylic glass backdrop + dark titlebar; falls back to
         # gradient textures if the composition call is unavailable.
@@ -192,7 +194,13 @@ class G16App(ctk.CTk):
             if os.path.exists(p):
                 req = open(p, "r", encoding="utf-8").read().strip()
                 os.remove(p)
-                if req == "raise":
+                if req == "open_dash":
+                    self.open_game_dashboard("TEST MODE", "explorer.exe")
+                elif req == "close_dash":
+                    if self.game_dashboard:
+                        self.game_dashboard.close_dashboard()
+                        self.game_dashboard = None
+                elif req == "raise":
                     # bring window to front (headless automation helper)
                     self.attributes("-topmost", True)
                     self.lift()
@@ -982,6 +990,14 @@ class G16App(ctk.CTk):
         self.auto_record_switch.select()
         self.auto_record_switch.pack(side="right")
 
+        self.dash_switch = ctk.CTkSwitch(
+            rec_row,
+            text="Second-screen dashboard",
+            font=ctk.CTkFont(size=11),
+        )
+        self.dash_switch.select()
+        self.dash_switch.pack(side="right", padx=(0, 16))
+
         self.record_status = ctk.CTkLabel(val_card, text="", font=ctk.CTkFont(size=11), text_color=COLOR_TEXT_MUTED)
         self.record_status.pack(padx=20, anchor="w", pady=(0, 4))
 
@@ -1106,6 +1122,8 @@ class G16App(ctk.CTk):
         self.maybe_autorecord(game_info.get("name", "game"), game_info.get("path"))
 
     def maybe_autorecord(self, game_name: str, exe_path: str = None):
+        if self.dash_switch.get() == 1:
+            self.open_game_dashboard(game_name, exe_path)
         if self.auto_record_switch.get() == 1:
             if not self.backend.is_match_logging():
                 self.backend.start_match_logging(game_name, exe_path)
@@ -1350,6 +1368,42 @@ class G16App(ctk.CTk):
         render_table(self.val_map_frame, summary.get("maps", {}), "map")
 
         self._rr_render(rank.get("climb", []))
+
+    def open_game_dashboard(self, game_name: str, exe_path: str = None):
+        """Open the portrait second-screen dashboard (auto-fits the vertical monitor)."""
+        try:
+            if self.game_dashboard is not None:
+                self.game_dashboard.close_dashboard()
+                self.game_dashboard = None
+            monitors = dashboard_widget.enumerate_monitors()
+            monitor = dashboard_widget.pick_second_monitor()
+            with open(os.path.join(SCRIPT_DIR, "dash_debug.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] monitors={monitors} picked={monitor}\n")
+            if monitor is None:
+                # no second monitor - place a tall window on the right of primary
+                pri = [m for m in dashboard_widget.enumerate_monitors() if m["primary"]]
+                pri = pri[0] if pri else {"left": 0, "top": 0, "width": 2560, "height": 1440}
+                monitor = {"left": pri["left"] + pri["width"] - 720,
+                           "top": pri["top"] + 60, "width": 720, "height": 1200}
+            exe_name = os.path.basename(exe_path) if exe_path else "game.exe"
+            self.game_dashboard = dashboard_widget.GameDashboardWindow(
+                self, game_name, exe_name, monitor)
+            self.game_dashboard.protocol("WM_DELETE_WINDOW", self._dashboard_closed)
+            with open(os.path.join(SCRIPT_DIR, "dash_debug.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] dashboard created at "
+                        f"{monitor['width']}x{monitor['height']}+{monitor['left']}+{monitor['top']}\n")
+            return True
+        except Exception:
+            import traceback
+            try:
+                with open(os.path.join(SCRIPT_DIR, "dash_debug.log"), "a", encoding="utf-8") as f:
+                    f.write(traceback.format_exc() + "\n")
+            except Exception:
+                pass
+            return False
+
+    def _dashboard_closed(self):
+        self.game_dashboard = None
 
     # ==========================================
     # View: Settings
@@ -1652,9 +1706,14 @@ class G16App(ctk.CTk):
         if hasattr(self, "temp_graph"):
             self.temp_graph.update_temps(state.cpu_temp, state.gpu_temp)
 
-        # 7. Update Mini HUD if active
+        # 7. Update Mini HUD + second-screen dashboard if active
         if self.mini_hud and self.mini_hud.winfo_viewable():
             self.mini_hud.update_telemetry(state)
+        if self.game_dashboard is not None:
+            try:
+                self.game_dashboard.update_state(state)
+            except Exception:
+                self.game_dashboard = None
 
         # 8. Fan RPMs
         if state.cpu_rpm is not None:

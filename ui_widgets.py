@@ -179,3 +179,5 @@ class MiniHUDWindow(ctk.CTkToplevel):
 
         text = f"▲ G16 | CPU: {cpu_t}°C ({cpu_u}%) | GPU: {gpu_t}°C ({gpu_u}%) | RAM: {ram}GB | {mode}"
         self.stats_label.configure(text=text)
+
+
