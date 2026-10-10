@@ -1,0 +1,2 @@
+assets/CameraTimerWorker-Cyqa2Ufy.js
+assets/screenCaptureWorker-7rBjoYut.js
