@@ -187,6 +187,46 @@ class G16App(ctk.CTk):
         # Remote shot requests: write a tab name to .shot_request and the app
         # switches to it (used by headless screenshot automation)
         self.after(400, self._check_shot_request)
+        self.after(1500, self._monitor_fit_loop)
+
+    def _monitor_fit_loop(self):
+        """Keep the window inside whatever monitor it currently sits on:
+        shrink the widget scale when the screen is narrower than the window
+        (e.g. the portrait secondary screen), restore when back on primary."""
+        try:
+            self._fit_to_monitor()
+        except Exception:
+            pass
+        self.after(2000, self._monitor_fit_loop)
+
+    def _fit_to_monitor(self):
+        if self.state() == "iconic" or self.winfo_width() < 100:
+            return
+        x, y = self.winfo_x(), self.winfo_y()
+        w, h = self.winfo_width(), self.winfo_height()
+        cx, cy = x + w // 2, y + h // 2
+        target = None
+        for m in dashboard_widget.enumerate_monitors():
+            if m["left"] <= cx < m["left"] + m["width"] and                m["top"] <= cy < m["top"] + m["height"]:
+                target = m
+                break
+        if target is None:
+            return
+        avail_w = min(target["work_width"], target["width"]) - 24
+        avail_h = min(target["work_height"], target["height"]) - 24
+        widget_scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        phys_w = w * widget_scaling
+        phys_h = h * widget_scaling
+        s = min(1.0, avail_w / max(phys_w, 1), avail_h / max(phys_h, 1))
+        if s < 0.98:
+            new_scaling = max(widget_scaling * s, 0.6)
+            if abs(new_scaling - widget_scaling) > 0.01:
+                ctk.ScalingTracker.set_window_scaling(new_scaling)
+        # clamp the window into the monitor's work area
+        nx = max(target["work_left"], min(self.winfo_x(), target["work_left"] + avail_w - 40))
+        ny = max(target["work_top"], min(self.winfo_y(), target["work_top"] + avail_h - 40))
+        if (nx, ny) != (self.winfo_x(), self.winfo_y()):
+            self.geometry(f"+{nx}+{ny}")
 
     def _check_shot_request(self):
         try:

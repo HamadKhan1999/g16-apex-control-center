@@ -35,9 +35,12 @@ def enumerate_monitors():
         mi.cbSize = ctypes.sizeof(MONITORINFO)
         if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
             rc = mi.rcMonitor
+            wk = mi.rcWork
             out.append({
                 "left": rc.left, "top": rc.top,
                 "width": rc.right - rc.left, "height": rc.bottom - rc.top,
+                "work_left": wk.left, "work_top": wk.top,
+                "work_width": wk.right - wk.left, "work_height": wk.bottom - wk.top,
                 "primary": bool(mi.dwFlags & MONITORINFOF_PRIMARY),
             })
         return True
@@ -95,7 +98,7 @@ class GameDashboardWindow(ctk.CTkToplevel):
         self.bind("<Escape>", lambda e: self.close_dashboard())
 
         col = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        col.pack(fill="both", expand=True, padx=14, pady=24)
+        col.pack(fill="both", expand=True, padx=10, pady=20)
 
         # Header
         hdr = ctk.CTkFrame(col, fg_color="transparent")
