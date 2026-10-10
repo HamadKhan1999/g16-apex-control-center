@@ -1,0 +1,30 @@
+# runtime artifacts
+__pycache__/
+*.pyc
+*.log
+.shot_request
+crash_trace.log
+settings.json
+custom_games.json
+test-output.log
+elev-marker.txt
+battery-report.html
+icon_check.png
+test_icon.png
+current_screen.png
+
+# user data
+match_logs/
+valorant_data/
+g16fan.log
+
+# third-party binaries (see README for download links)
+tools/
+
+# local scratch
+research/alienfx-src/
+research/*.zip
+OpenRGB.json
+
+# local session data
+.zcode/
