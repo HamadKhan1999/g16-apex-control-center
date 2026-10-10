@@ -221,15 +221,16 @@ class RgbEngine:
 
 
 class FpsMonitor:
-    """Live in-game FPS via Intel PresentMon (ETW frame capture).
+    """Per-frame capture + rolling frame-delivery statistics (Intel PresentMon).
 
-    PresentMon needs elevated privileges - the Control Center runs elevated
-    via the G16ControlCenter scheduled task, so spawns inherit that.
-    Computes a rolling average FPS from frame-present deltas.
+    PresentMon streams one CSV row per presented frame from its own process
+    (ETW capture, <1% there). We keep a ~10 s rolling window of frame times
+    and once per second compute: avg fps, 1% low fps, frametime CV %,
+    spikes/min. The delivery grade + attribution are derived by the backend.
     """
 
-    def __init__(self, on_fps=None):
-        self.on_fps = on_fps
+    def __init__(self, on_stats=None):
+        self.on_stats = on_stats            # callable(dict) once per second
         self.exe = None
         self.proc = None
         self._thread = None
@@ -260,45 +261,79 @@ class FpsMonitor:
         import csv as _csv
         from collections import deque
 
-        frames = deque(maxlen=45)
+        ft_display = deque(maxlen=2400)   # ms between display changes
+        ft_present = deque(maxlen=2400)   # ms between presents (CPU pacing)
+        last_tick = time.time()
+        fps_idx = disp_idx = pres_idx = None
+        si = None
         try:
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             self.proc = subprocess.Popen(
                 [self.exe_path, "--process_name", self.exe, "--output_stdout"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace",
-                startupinfo=si)
+                text=True, encoding="utf-8", errors="replace", startupinfo=si)
             log.info("PresentMon started for %s", self.exe)
-            reader = _csv.reader(self.proc.stdout)
-            fps_idx = None
-            for row in reader:
-                if self._stop.is_set():
-                    break
-                if not row:
-                    continue
-                if fps_idx is None:
-                    if "Application" in row:
-                        for cand in ("msBetweenDisplayChange", "msBetweenPresents"):
-                            if cand in row:
-                                fps_idx = row.index(cand)
-                                break
-                    continue
-                if fps_idx >= len(row):
-                    continue
-                try:
-                    ms = float(row[fps_idx])
-                except ValueError:
-                    continue
-                if ms > 0.05:
-                    frames.append(1000.0 / ms)
-                    if self.on_fps:
-                        try:
-                            self.on_fps(sum(frames) / len(frames))
-                        except Exception:
-                            pass
         except Exception as ex:
-            log.debug("PresentMon reader ended: %s", ex)
+            log.warning("PresentMon spawn failed: %s", ex)
+            return
+
+        for row in _csv.reader(self.proc.stdout):
+            if self._stop.is_set():
+                break
+            if not row:
+                continue
+            if disp_idx is None:
+                if "Application" in row:
+                    for cand, var in (("msBetweenDisplayChange", "disp"),
+                                      ("msBetweenPresents", "pres")):
+                        if cand in row:
+                            if var == "disp":
+                                disp_idx = row.index(cand)
+                            else:
+                                pres_idx = row.index(cand)
+                    if disp_idx is None:
+                        return
+                continue
+            try:
+                d_ms = float(row[disp_idx])
+            except (ValueError, IndexError):
+                continue
+            if d_ms <= 0.05:
+                continue
+            ft_display.append(d_ms)
+            if pres_idx is not None:
+                try:
+                    ft_present.append(float(row[pres_idx]))
+                except (ValueError, IndexError):
+                    pass
+
+            now = time.time()
+            if self.on_stats and now - last_tick >= 1.0 and len(ft_display) >= 30:
+                last_tick = now
+                try:
+                    self.on_stats(self._compute(ft_display, ft_present))
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _compute(ft_display, ft_present):
+        import statistics
+        arr = sorted(ft_display)
+        cnt = len(arr)
+        mean = sum(arr) / cnt
+        avg_fps = 1000.0 / mean if mean > 0 else 0.0
+        p99 = arr[min(cnt - 1, int(cnt * 0.99))]      # worse-1% frame time
+        fps_1pct = 1000.0 / p99 if p99 > 0 else 0.0
+        cv = (statistics.pstdev(arr) / mean * 100.0) if mean > 0 else 0.0
+        med = arr[cnt // 2]
+        spikes = sum(1 for x in arr if x > max(med * 2.0, 8.0))
+        window_s = max(cnt * mean / 1000.0, 1.0)
+        spikes_min = spikes / window_s * 60.0
+        return {"avg_fps": round(avg_fps, 1), "fps_1pct": round(fps_1pct, 1),
+                "cv_pct": round(cv, 1), "spikes_min": round(spikes_min, 1),
+                "window_s": round(window_s, 1)}
+
 
 
 class MatchLogger:
@@ -311,7 +346,7 @@ class MatchLogger:
 
     HEADER = ("time,cpu_temp,gpu_temp,cpu_load_pct,cpu_mhz,"
               "gpu_util_pct,gpu_clock_mhz,gpu_power_w,vram_mb,"
-              "cpu_fan_rpm,gpu_fan_rpm,fps,mode,failsafe")
+              "cpu_fan_rpm,gpu_fan_rpm,fps,fps_1pct,cv_pct,spikes_min,grade,limiter,mode,failsafe")
 
     def __init__(self, game_name: str = "match"):
         import datetime
@@ -330,7 +365,8 @@ class MatchLogger:
             row = (f"{int(time.time() )},{s.cpu_temp or 0},{s.gpu_temp or 0},"
                    f"{s.cpu_usage:.0f},{s.cpu_mhz:.0f},"
                    f"{s.gpu_util},{s.gpu_clock_mhz},{s.gpu_power_w:.1f},{s.gpu_vram_used_mb},"
-                   f"{s.cpu_rpm or 0},{s.gpu_rpm or 0},"
+                   f"{s.cpu_rpm or 0},{s.gpu_rpm or 0},{s.fps:.0f},{s.fps_1pct:.0f},"
+                   f"{s.cv_pct:.0f},{s.spikes_min:.0f},{s.grade},{s.limiter},"
                    f"{s.current_mode},{1 if s.failsafe_active else 0}")
             self._fh.write(row + "\n")
             self._rows += 1
@@ -381,6 +417,14 @@ class HardwareState:
         self.net_sent_kb: float = 0.0
         self.net_recv_kb: float = 0.0
         self.fps: float = 0.0
+        self.fps_1pct: float = 0.0
+        self.cv_pct: float = 0.0
+        self.spikes_min: float = 0.0
+        self.grade: str = "--"
+        self.limiter: str = ""
+        self.attribution: str = ""
+        self.gpu_throttle: str = ""
+        self.cpu_max_thread: float = 0.0
 
         # Detailed GPU Stats (RTX 4070 Laptop via nvidia-smi)
         self.gpu_util: int = 0
@@ -441,7 +485,7 @@ class G16Backend:
         self.match_logger = None
 
         # Live FPS via PresentMon (spawned when a game's logging starts)
-        self.fps_mon = FpsMonitor(on_fps=self._on_fps)
+        self.fps_mon = FpsMonitor(on_stats=self._on_frame_stats)
 
         # Native NVML setup (Direct C-level, zero subprocess overhead).
         # Init may fail here if the dGPU is asleep (Advanced Optimus); the
@@ -614,6 +658,9 @@ class G16Backend:
                 # 3. Check Fail-Safe logic
                 self._check_failsafe(awcc)
 
+                # 3b. Game per-thread max load (every 2s; single-thread bound detection)
+                self._sample_game_threads()
+
                 # 4. Match logger - piggybacks on this existing telemetry
                 #    cycle: one buffered CSV line from data already collected.
                 if self.match_logger:
@@ -727,9 +774,77 @@ class G16Backend:
     def is_match_logging(self) -> bool:
         return self.match_logger is not None
 
-    def _on_fps(self, value: float):
+    def _on_frame_stats(self, m: dict):
+        """Delivery-quality grade + limiter/attribution, once per second."""
         with self._state_lock:
-            self.state.fps = round(value, 1)
+            self.state.fps = m["avg_fps"]
+            self.state.fps_1pct = m["fps_1pct"]
+            self.state.cv_pct = m["cv_pct"]
+            self.state.spikes_min = m["spikes_min"]
+            low_ratio = m["fps_1pct"] / max(m["avg_fps"], 1.0)
+            cv = m["cv_pct"]
+            grade_before = self.state.grade
+
+        if m["avg_fps"] < 5:
+            return  # PresentMon warming up / nothing presenting
+
+        if m["spikes_min"] > 10 or cv >= 22 or low_ratio < 0.65:
+            raw = "STRUGGLING"
+        elif cv >= 12 or low_ratio < 0.80:
+            raw = "BUMPY"
+        elif cv >= 6 or low_ratio < 0.92:
+            raw = "SMOOTH"
+        else:
+            raw = "SILK"
+
+        # hysteresis: 3 consecutive agreeing ticks before the grade changes
+        if getattr(self, "_grade_pending", None) == raw:
+            self._grade_streak = getattr(self, "_grade_streak", 0) + 1
+        else:
+            self._grade_pending = raw
+            self._grade_streak = 1
+        if self._grade_streak < 3 and grade_before not in ("--", raw):
+            return
+
+        limiter, attrib = self._classify(bumpy=(raw in ("BUMPY", "STRUGGLING")))
+        with self._state_lock:
+            self.state.grade = raw
+            self.state.limiter = limiter
+            self.state.attribution = attrib if raw in ("BUMPY", "STRUGGLING") else ""
+
+    def _classify(self, bumpy: bool):
+        vram_ratio = ((self.state.gpu_vram_used_mb / max(self.state.gpu_vram_total_mb, 1))
+                      if self.state.gpu_vram_total_mb else 0)
+        util = self.state.gpu_util
+        max_thread = self.state.cpu_max_thread
+        temp_hot = (self.state.cpu_temp or 0) >= self.critical_temp - 8
+
+        if util >= 95:
+            limiter = "GPU render"
+        elif max_thread >= 90:
+            limiter = "CPU single-thread"
+        elif vram_ratio > 0.95:
+            limiter = "VRAM"
+        elif temp_hot:
+            limiter = "CPU thermal trim"
+        else:
+            limiter = "Balanced (no single wall)"
+
+        if not bumpy:
+            return limiter, ""
+
+        throttle = (self.state.gpu_throttle or "").lower()
+        if "power" in throttle:
+            return limiter, "GPU power-capping during spikes"
+        if "thermal" in throttle or "slowdown" in throttle:
+            return limiter, "GPU thermal slowdown during spikes"
+        if vram_ratio > 0.92:
+            return limiter, "VRAM spill - asset streaming stalls"
+        if max_thread >= 90:
+            return limiter, "single-thread pegged (boost core squatting?)"
+        if temp_hot:
+            return limiter, "CPU thermal trim window"
+        return limiter, "game-side hitch (no local resource correlation)"
 
     def _apply_tcc(self, awcc: AWCC, offset: int):
         """Apply the TCC activation offset, respecting firmware limits."""
@@ -813,6 +928,38 @@ class G16Backend:
         # Query NVIDIA RTX 4070 Telemetry every cycle
         self._poll_nvidia_stats()
 
+    def _sample_game_threads(self):
+        """Max single-thread load of the game process (single-thread bound detection)."""
+        if not self.fps_mon.exe:
+            return
+        now = time.time()
+        if now - getattr(self, "_last_thread_sample", 0) < 2.0:
+            return
+        self._last_thread_sample = now
+        try:
+            import psutil as _ps
+            if getattr(self, "_game_proc", None) is None:
+                for p in _ps.process_iter(["name"]):
+                    if (p.info.get("name") or "").lower() == self.fps_mon.exe:
+                        self._game_proc = p
+                        break
+                else:
+                    return
+            proc = self._game_proc
+            if not proc.is_running():
+                self._game_proc = None
+                return
+            snap = [(t.user + t.system) for t in proc.threads()]
+            prev = getattr(self, "_prev_thread_snap", None)
+            if prev and len(prev) == len(snap):
+                peak = max(snap[i] - prev[i] for i in range(len(snap)))
+                pct = min(peak / 2.0 * 100.0, 100.0)  # over the 2 s window
+                with self._state_lock:
+                    self.state.cpu_max_thread = pct
+            self._prev_thread_snap = snap
+        except Exception:
+            pass
+
     def _poll_nvidia_stats(self):
         # Lazy (re-)init: the dGPU may be asleep (Advanced Optimus / rtD3) at
         # app launch; polling NVML wakes it. Retry every 5 cycles until it
@@ -843,6 +990,7 @@ class G16Backend:
         # transient failure never overwrites good readings with zeros.
         clock_mhz = None
         power_w = None
+        throttle_str = None
         vram_used = None
         vram_total = None
         gpu_util = None
@@ -868,6 +1016,18 @@ class G16Backend:
             util = nvmlUtilization_t()
             if self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle, ctypes.byref(util)) == 0:
                 gpu_util = util.gpu
+
+            # 5. Clock throttle reasons (why clocks are not at max)
+            reasons = ctypes.c_ulonglong()
+            if self._nvml.nvmlDeviceGetCurrentClocksThrottleReasons(
+                    self._nvml_handle, ctypes.byref(reasons)) == 0:
+                bits = []
+                if reasons.value & 0x1:  bits.append("idle")
+                if reasons.value & 0x2:  bits.append("app-clocks")
+                if reasons.value & 0x4:  bits.append("power-cap")
+                if reasons.value & 0x28: bits.append("thermal")
+                if reasons.value & 0x80: bits.append("power-brake")
+                throttle_str = ",".join(bits)
         except Exception:
             pass
 
@@ -882,6 +1042,8 @@ class G16Backend:
                 self.state.gpu_vram_total_mb = vram_total
             if gpu_util is not None:
                 self.state.gpu_util = gpu_util
+            if throttle_str is not None:
+                self.state.gpu_throttle = throttle_str
 
         # If every query failed this cycle, track it; after 8 consecutive
         # dead cycles the dGPU has probably powered off (rtD3 deep sleep) -
@@ -1008,6 +1170,14 @@ class G16Backend:
         s.net_sent_kb = self.state.net_sent_kb
         s.net_recv_kb = self.state.net_recv_kb
         s.fps = self.state.fps
+        s.fps_1pct = self.state.fps_1pct
+        s.cv_pct = self.state.cv_pct
+        s.spikes_min = self.state.spikes_min
+        s.grade = self.state.grade
+        s.limiter = self.state.limiter
+        s.attribution = self.state.attribution
+        s.gpu_throttle = self.state.gpu_throttle
+        s.cpu_max_thread = self.state.cpu_max_thread
         # Detailed GPU (NVML) + power state
         s.gpu_util = self.state.gpu_util
         s.gpu_vram_used_mb = self.state.gpu_vram_used_mb

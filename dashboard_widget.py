@@ -1,5 +1,7 @@
 """dashboard_widget.py - Portrait second-screen game dashboard."""
 
+COLOR_MUTED_DEFAULT = "#64748b"
+
 import time
 import tkinter as tk
 from typing import Optional
@@ -103,12 +105,54 @@ class GameDashboardWindow(ctk.CTkToplevel):
         fps_card = ctk.CTkFrame(col, fg_color="#12141f", corner_radius=16,
                                 border_width=1, border_color="#00e5ff")
         fps_card.pack(fill="x", pady=10, ipady=8)
-        ctk.CTkLabel(fps_card, text="LIVE FPS",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color="#7c8aa0").pack(anchor="w", padx=30, pady=(10, 0))
+
+        # delivery grade hero (headline metric)
+        grade_row = ctk.CTkFrame(fps_card, fg_color="transparent")
+        grade_row.pack(fill="x", padx=30, pady=(14, 0))
+        self.grade_lbl = ctk.CTkLabel(
+            grade_row, text="--",
+            font=ctk.CTkFont(family="Segoe UI", size=44, weight="bold"),
+            text_color="#475569")
+        self.grade_lbl.pack(side="left")
+        self.fps_stats_lbl = ctk.CTkLabel(
+            grade_row, text="-- fps avg\n-- fps 1% low",
+            font=ctk.CTkFont(family="Consolas", size=18),
+            text_color="#94a3b8", justify="left", anchor="w")
+        self.fps_stats_lbl.pack(side="right")
+
+        # frame variance animated sliding bar (30 fps, coords-move only)
+        ctk.CTkLabel(fps_card, text="FRAME-TIME VARIANCE",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#7c8aa0").pack(anchor="w", padx=30, pady=(14, 0))
+        self.cv_canvas = tk.Canvas(fps_card, height=26, bg="#0c0e18",
+                                   highlightthickness=0, bd=0)
+        self.cv_canvas.pack(fill="x", padx=30, pady=(0, 4))
+        self._cv_disp = 0.0     # animated (displayed) value
+        self._cv_target = 0.0   # target value (set once per second)
+        self._cv_rect = None
+        self.after(33, self._animate_cv)
+
+        self.fps_detail_lbl = ctk.CTkLabel(
+            fps_card, text="spikes --/min",
+            font=ctk.CTkFont(family="Consolas", size=14),
+            text_color="#94a3b8", anchor="w")
+        self.fps_detail_lbl.pack(anchor="w", padx=30, pady=(2, 0))
+
+        # attribution + limiter lines
+        self.attr_lbl = ctk.CTkLabel(
+            fps_card, text="",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color="#f59e0b",
+            anchor="w")
+        self.attr_lbl.pack(anchor="w", padx=30, pady=(6, 0))
+        self.limiter_lbl = ctk.CTkLabel(
+            fps_card, text="",
+            font=ctk.CTkFont(family="Consolas", size=13),
+            text_color="#7c8aa0", anchor="w")
+        self.limiter_lbl.pack(anchor="w", padx=30, pady=(0, 8))
+
         self.fps_big = ctk.CTkLabel(
             fps_card, text="--",
-            font=ctk.CTkFont(family="Segoe UI", size=150, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=110, weight="bold"),
             text_color="#f1f5f9")
         self.fps_big.pack(anchor="w", padx=30)
         self.fps_graph = tk.Canvas(fps_card, height=320, bg="#0c0e18",
@@ -190,6 +234,31 @@ class GameDashboardWindow(ctk.CTkToplevel):
             pass
         self.after(1000, self._tick)
 
+    def _animate_cv(self):
+        """30 fps sliding-bar animation: move existing canvas items only.
+        Runs on the second monitor's (otherwise idle) UI thread; skipped
+        entirely when the dashboard is hidden."""
+        if self._closed:
+            return
+        if self.winfo_viewable():
+            self._cv_disp += (self._cv_target - self._cv_disp) * 0.18
+            if abs(self._cv_target - self._cv_disp) < 0.15:
+                self._cv_disp = self._cv_target
+            c = self.cv_canvas
+            w = c.winfo_width() or 600
+            h = 26
+            bar_w = min(self._cv_disp / 40.0, 1.0) * w
+            cv = self._cv_disp
+            color = "#10b981" if cv < 6 else "#00e5ff" if cv < 12 \
+                else "#f59e0b" if cv < 22 else "#ef4444"
+            if self._cv_rect is None:
+                self._cv_rect = c.create_rectangle(0, 3, bar_w, h - 3,
+                                                   fill=color, width=0)
+            else:
+                c.coords(self._cv_rect, 0, 3, bar_w, h - 3)
+                c.itemconfigure(self._cv_rect, fill=color)
+        self.after(33, self._animate_cv)
+
     def update_state(self, state):
         """Called ~1/s from the app with fresh HardwareState."""
         if self._closed or not self.winfo_exists():
@@ -198,6 +267,29 @@ class GameDashboardWindow(ctk.CTkToplevel):
         self.fps_big.configure(text=f"{fps:.0f}" if fps else "--")
         self.fps_history.append(fps or 0)
         self._draw_fps_graph()
+
+        # delivery grade + stability metrics
+        grade = state.grade or "--"
+        gcolor = {"SILK": "#10b981", "SMOOTH": "#00e5ff", "BUMPY": "#f59e0b",
+                  "STRUGGLING": "#ef4444"}.get(grade, "#475569")
+        self.grade_lbl.configure(text=grade, text_color=gcolor)
+        self.fps_stats_lbl.configure(
+            text=f"{state.fps:.0f} fps avg\n{state.fps_1pct:.0f} fps 1% low")
+        self._cv_target = min(state.cv_pct, 40.0)
+        self.fps_detail_lbl.configure(
+            text=f"spikes {state.spikes_min:.0f}/min   |   "
+                 f"variance {state.cv_pct:.0f}%   |   "
+                 f"1% low {100 * state.fps_1pct / max(state.fps, 1):.0f}% of avg")
+        if state.attribution:
+            self.attr_lbl.configure(text=f"⚠ {state.attribution}",
+                                    text_color="#f59e0b")
+        elif grade in ("SILK", "SMOOTH"):
+            self.attr_lbl.configure(text="✓ frame delivery is clean",
+                                    text_color="#10b981")
+        else:
+            self.attr_lbl.configure(text="", text_color=COLOR_MUTED_DEFAULT)
+        self.limiter_lbl.configure(
+            text=f"limiter: {state.limiter or 'measuring...'}")
 
         for card, temp, load, clock, util in (
                 (self.cpu_card, state.cpu_temp, state.cpu_usage, state.cpu_mhz, state.cpu_usage),
